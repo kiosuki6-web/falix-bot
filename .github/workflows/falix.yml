@@ -1,0 +1,20 @@
+name: Iniciar servidor Falix
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+jobs:
+  iniciar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Consultar estado del servidor
+        env:
+          FALIX_API_KEY: ${{ secrets.FALIX_API_KEY }}
+          FALIX_SERVER_ID: ${{ vars.FALIX_SERVER_ID }}
+        run: |
+          curl -sS \
+            -H "Authorization: Bearer $FALIX_API_KEY" \
+            -H "Accept: application/json" \
+            "https://client.falixnodes.net/api/v2/servers/$FALIX_SERVER_ID/console/status"
