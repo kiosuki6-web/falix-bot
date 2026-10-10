@@ -10,13 +10,14 @@ API_KEYS = [
     os.getenv("FALIX_API_KEY", "").strip(),
     os.getenv("FALIX_API_KEY_2", "").strip(),
 ]
-API_KEYS = [key for key in API_KEYS if key]
+API_KEYS = list(dict.fromkeys(key for key in API_KEYS if key))
 
 ONLINE_INTERVAL = 300
 OFFLINE_INTERVAL = 120
 BUSY_INTERVAL = 120
 ERROR_INTERVAL = 300
-REQUEST_TIMEOUT = 30
+
+REQUEST_TIMEOUT = 20
 MAX_RETRIES = 2
 
 logging.basicConfig(
@@ -27,8 +28,18 @@ logging.basicConfig(
 session = requests.Session()
 
 
+class ApiAuthError(Exception):
+    def __init__(self, status_code):
+        self.status_code = status_code
+        super().__init__(f"HTTP {status_code}: autorización rechazada")
+
+
+class RateLimitError(Exception):
+    pass
+
+
 def request_api(method, url, api_key, **kwargs):
-    headers = kwargs.pop("headers", {})
+    headers = dict(kwargs.pop("headers", {}))
     headers.update({
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
@@ -44,21 +55,14 @@ def request_api(method, url, api_key, **kwargs):
                 **kwargs,
             )
 
-            if response.status_code == 403:
-                raise PermissionError(
-                    "HTTP 403: Falix rechazó la petición. "
-                    "No se repetirá automáticamente."
-                )
-
-            if response.status_code == 401:
-                raise PermissionError(
-                    "HTTP 401: la clave API no fue aceptada."
-                )
+            if response.status_code in (401, 403):
+                raise ApiAuthError(response.status_code)
 
             if response.status_code == 429:
-                raise RuntimeError(
-                    "HTTP 429: Falix limitó las solicitudes. "
-                    "Se respetará el límite."
+                retry_after = response.headers.get("Retry-After", "")
+                raise RateLimitError(
+                    f"Falix respondió HTTP 429. "
+                    f"Retry-After={retry_after or 'no indicado'}"
                 )
 
             if response.status_code >= 500:
@@ -78,10 +82,53 @@ def request_api(method, url, api_key, **kwargs):
     raise RuntimeError("No se pudo completar la petición.")
 
 
-def consultar_estado(api_key):
-    url = f"{API_BASE}/servers/{SERVER_ID}/status"
-    response = request_api("GET", url, api_key)
+def probar_claves(funcion, descripcion):
+    if not API_KEYS:
+        raise RuntimeError(
+            "Faltan FALIX_API_KEY y FALIX_API_KEY_2 en "
+            "GitHub Secrets."
+        )
 
+    ultimo_error = None
+
+    for numero, api_key in enumerate(API_KEYS, start=1):
+        try:
+            resultado = funcion(api_key)
+
+            if numero > 1:
+                logging.info(
+                    "La segunda clave funcionó para: %s.",
+                    descripcion,
+                )
+
+            return resultado, api_key
+
+        except ApiAuthError as error:
+            ultimo_error = error
+
+            logging.warning(
+                "%s: la clave %s fue rechazada con HTTP %s.",
+                descripcion,
+                numero,
+                error.status_code,
+            )
+
+        except RateLimitError:
+            # No cambiar de clave para eludir límites de solicitudes.
+            raise
+
+    if ultimo_error:
+        raise ultimo_error
+
+    raise RuntimeError(
+        f"No se pudo completar la operación: {descripcion}."
+    )
+
+
+def consultar_estado_con_clave(api_key):
+    url = f"{API_BASE}/servers/{SERVER_ID}/status"
+
+    response = request_api("GET", url, api_key)
     payload = response.json()
     data = payload.get("data", payload)
 
@@ -91,7 +138,15 @@ def consultar_estado(api_key):
     return data
 
 
-def iniciar_servidor(api_key):
+def consultar_estado():
+    data, api_key = probar_claves(
+        consultar_estado_con_clave,
+        "consulta del estado",
+    )
+    return data, api_key
+
+
+def iniciar_con_clave(api_key):
     url = f"{API_BASE}/servers/{SERVER_ID}/power"
 
     response = request_api(
@@ -106,28 +161,26 @@ def iniciar_servidor(api_key):
         "Falix respondió HTTP %s a la orden de inicio.",
         response.status_code,
     )
-    return response.json()
+
+    try:
+        resultado = response.json()
+    except ValueError:
+        resultado = {}
+
+    logging.info(
+        "Respuesta de encendido recibida. "
+        "Se comprobará el estado antes de emitir otra orden."
+    )
+
+    return resultado
 
 
-def obtener_estado():
-    if not API_KEYS:
-        raise RuntimeError(
-            "Faltan los secretos FALIX_API_KEY y FALIX_API_KEY_2."
-        )
-
-    ultimo_error = None
-
-    for api_key in API_KEYS:
-        try:
-            return consultar_estado(api_key), api_key
-        except PermissionError as error:
-            ultimo_error = error
-            logging.warning("%s", error)
-
-    if ultimo_error:
-        raise ultimo_error
-
-    raise RuntimeError("No se pudo consultar el estado.")
+def iniciar_servidor():
+    resultado, _ = probar_claves(
+        iniciar_con_clave,
+        "orden de encendido",
+    )
+    return resultado
 
 
 def clasificar_estado(data):
@@ -142,6 +195,7 @@ def clasificar_estado(data):
         lifecycle or "desconocido",
     )
 
+    # Si el ciclo de vida indica una transición, no iniciar de nuevo.
     busy_words = (
         "restor",
         "backup",
@@ -174,19 +228,18 @@ def ejecutar():
     logging.info("Falix Keeper iniciado.")
     logging.info("Servidor configurado: %s", SERVER_ID)
 
-    # Evita enviar otra orden en el siguiente ciclo
-    # si la orden anterior fue aceptada.
+    # Evita repetir órdenes si ya se solicitó el encendido.
     inicio_solicitado = False
 
     while True:
         espera = ERROR_INTERVAL
 
         try:
-            data, api_key = obtener_estado()
+            data, _ = consultar_estado()
             estado = clasificar_estado(data)
 
             if estado == "activo":
-                logging.info("El servidor está activo.")
+                logging.info("Servidor activo.")
                 inicio_solicitado = False
                 espera = ONLINE_INTERVAL
 
@@ -200,31 +253,42 @@ def ejecutar():
             elif estado == "apagado":
                 if inicio_solicitado:
                     logging.info(
-                        "Ya se solicitó el inicio. "
+                        "El encendido ya fue solicitado. "
                         "Se comprobará el estado antes de repetir."
                     )
                     espera = OFFLINE_INTERVAL
+
                 else:
                     logging.warning(
-                        "Servidor apagado. Solicitando inicio."
+                        "Servidor apagado. "
+                        "Probando las claves autorizadas para encender."
                     )
 
                     try:
-                        iniciar_servidor(api_key)
+                        iniciar_servidor()
                         inicio_solicitado = True
                         espera = OFFLINE_INTERVAL
 
-                    except PermissionError as error:
+                    except ApiAuthError as error:
+                        logging.error(
+                            "Las claves disponibles no pudieron "
+                            "autorizar el encendido: HTTP %s.",
+                            error.status_code,
+                        )
+                        espera = ERROR_INTERVAL
+
+                    except RateLimitError as error:
                         logging.error("%s", error)
                         espera = ERROR_INTERVAL
 
                     except requests.RequestException as error:
                         logging.error(
-                            "Fallo de conexión al iniciar: %s",
+                            "Error de conexión al enviar el encendido: %s.",
                             type(error).__name__,
                         )
-                        # La orden podría haber llegado a Falix
-                        # aunque la respuesta se haya perdido.
+
+                        # La orden podría haber llegado a Falix.
+                        # No se repetirá inmediatamente.
                         inicio_solicitado = True
                         espera = ERROR_INTERVAL
 
@@ -234,15 +298,22 @@ def ejecutar():
                 )
                 espera = ERROR_INTERVAL
 
+        except RateLimitError as error:
+            logging.error("%s", error)
+            espera = ERROR_INTERVAL
+
         except Exception as error:
             logging.error(
-                "Error: %s: %s",
+                "Error al consultar o procesar el estado: %s: %s",
                 type(error).__name__,
                 error,
             )
             espera = ERROR_INTERVAL
 
-        logging.info("Próxima comprobación en %s segundos.", espera)
+        logging.info(
+            "Próxima comprobación en %s segundos.",
+            espera,
+        )
         time.sleep(espera)
 
 
