@@ -1,10 +1,17 @@
+
 name: Falix Keeper
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: read
+
+concurrency:
+  group: falix-keeper
+  cancel-in-progress: false
 
 jobs:
   keeper:
@@ -19,6 +26,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
       - name: Instalar dependencias
         run: pip install -r requirements.txt
@@ -28,3 +37,4 @@ jobs:
           FALIX_API_KEY: ${{ secrets.FALIX_API_KEY }}
           FALIX_API_KEY_2: ${{ secrets.FALIX_API_KEY_2 }}
         run: python -u falix_keeper.py
+        
