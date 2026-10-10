@@ -3,10 +3,6 @@ import time
 import logging
 import requests
 
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
-
 SERVER_ID = "3504152"
 API_BASE = "https://client.falixnodes.net/api/v2"
 
@@ -20,13 +16,8 @@ ONLINE_INTERVAL = 300
 OFFLINE_INTERVAL = 120
 BUSY_INTERVAL = 120
 ERROR_INTERVAL = 300
-
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 2
-
-# ==========================================
-# REGISTRO
-# ==========================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,10 +27,6 @@ logging.basicConfig(
 session = requests.Session()
 
 
-# ==========================================
-# PETICIONES HTTP CON REINTENTOS LIMITADOS
-# ==========================================
-
 def request_api(method, url, api_key, **kwargs):
     headers = kwargs.pop("headers", {})
     headers.update({
@@ -47,7 +34,7 @@ def request_api(method, url, api_key, **kwargs):
         "Accept": "application/json",
     })
 
-    for intento in range(MAX_RETRIES + 1):
+    for attempt in range(MAX_RETRIES + 1):
         try:
             response = session.request(
                 method,
@@ -57,69 +44,52 @@ def request_api(method, url, api_key, **kwargs):
                 **kwargs,
             )
 
-            # No repetir automáticamente errores de permisos.
-            if response.status_code in (401, 403):
+            if response.status_code == 403:
                 raise PermissionError(
-                    f"Falix rechazó la petición: HTTP {response.status_code}. "
-                    "Comprueba los permisos de la clave API."
+                    "HTTP 403: Falix rechazó la petición. "
+                    "No se repetirá automáticamente."
+                )
+
+            if response.status_code == 401:
+                raise PermissionError(
+                    "HTTP 401: la clave API no fue aceptada."
                 )
 
             if response.status_code == 429:
                 raise RuntimeError(
-                    "Falix limitó las solicitudes (HTTP 429). "
-                    "Se pausará la automatización."
+                    "HTTP 429: Falix limitó las solicitudes. "
+                    "Se respetará el límite."
                 )
 
-            # Reintentar errores temporales del servidor.
             if response.status_code >= 500:
-                if intento < MAX_RETRIES:
-                    espera = 5 * (intento + 1)
-                    logging.warning(
-                        "Error temporal HTTP %s. Reintentando en %s segundos.",
-                        response.status_code,
-                        espera,
-                    )
-                    time.sleep(espera)
+                if attempt < MAX_RETRIES:
+                    time.sleep(5 * (attempt + 1))
                     continue
 
             response.raise_for_status()
             return response
 
-        except (requests.Timeout, requests.ConnectionError) as error:
-            if intento >= MAX_RETRIES:
+        except (requests.Timeout, requests.ConnectionError):
+            if attempt >= MAX_RETRIES:
                 raise
 
-            espera = 5 * (intento + 1)
-            logging.warning(
-                "Problema de conexión (%s). Reintentando en %s segundos.",
-                type(error).__name__,
-                espera,
-            )
-            time.sleep(espera)
+            time.sleep(5 * (attempt + 1))
 
     raise RuntimeError("No se pudo completar la petición.")
 
 
-# ==========================================
-# CONSULTAR ESTADO
-# ==========================================
-
 def consultar_estado(api_key):
     url = f"{API_BASE}/servers/{SERVER_ID}/status"
-
     response = request_api("GET", url, api_key)
+
     payload = response.json()
     data = payload.get("data", payload)
 
     if not isinstance(data, dict):
-        raise ValueError("La API devolvió un estado inesperado.")
+        raise ValueError("Respuesta de estado inesperada.")
 
     return data
 
-
-# ==========================================
-# INICIAR SERVIDOR
-# ==========================================
 
 def iniciar_servidor(api_key):
     url = f"{API_BASE}/servers/{SERVER_ID}/power"
@@ -132,14 +102,12 @@ def iniciar_servidor(api_key):
         json={"signal": "start"},
     )
 
-    logging.info("Respuesta de inicio: HTTP %s", response.status_code)
-    logging.info("Falix aceptó la petición de inicio.")
-    return True
+    logging.info(
+        "Falix respondió HTTP %s a la orden de inicio.",
+        response.status_code,
+    )
+    return response.json()
 
-
-# ==========================================
-# CONSULTAR USANDO LAS CLAVES CONFIGURADAS
-# ==========================================
 
 def obtener_estado():
     if not API_KEYS:
@@ -147,36 +115,26 @@ def obtener_estado():
             "Faltan los secretos FALIX_API_KEY y FALIX_API_KEY_2."
         )
 
-    errores = []
+    ultimo_error = None
 
     for api_key in API_KEYS:
         try:
-            data = consultar_estado(api_key)
-            return data, api_key
-
+            return consultar_estado(api_key), api_key
         except PermissionError as error:
-            errores.append(error)
+            ultimo_error = error
             logging.warning("%s", error)
 
-        except (requests.RequestException, ValueError) as error:
-            # Un fallo de conexión no demuestra que la clave sea inválida.
-            raise RuntimeError(
-                f"No se pudo consultar el estado: {type(error).__name__}"
-            ) from error
+    if ultimo_error:
+        raise ultimo_error
 
-    raise PermissionError(
-        "Ninguna clave configurada pudo consultar el servidor. "
-        "Revisa los permisos y los secretos de GitHub."
-    )
+    raise RuntimeError("No se pudo consultar el estado.")
 
-
-# ==========================================
-# CLASIFICAR ESTADO
-# ==========================================
 
 def clasificar_estado(data):
     state = str(data.get("state", "")).lower().strip()
-    lifecycle = str(data.get("lifecycle_status", "")).lower().strip()
+    lifecycle = str(
+        data.get("lifecycle_status", "")
+    ).lower().strip()
 
     logging.info(
         "Estado: state=%s | lifecycle_status=%s",
@@ -199,11 +157,9 @@ def clasificar_estado(data):
         "restarting",
     )
 
-    if any(word in lifecycle for word in busy_words):
-        return "ocupado"
-
-    if any(word in state for word in busy_words):
-        return "ocupado"
+    for value in (state, lifecycle):
+        if any(word in value for word in busy_words):
+            return "ocupado"
 
     if state in ("running", "online", "started"):
         return "activo"
@@ -214,13 +170,13 @@ def clasificar_estado(data):
     return "desconocido"
 
 
-# ==========================================
-# CICLO PRINCIPAL
-# ==========================================
-
 def ejecutar():
     logging.info("Falix Keeper iniciado.")
     logging.info("Servidor configurado: %s", SERVER_ID)
+
+    # Evita enviar otra orden en el siguiente ciclo
+    # si la orden anterior fue aceptada.
+    inicio_solicitado = False
 
     while True:
         espera = ERROR_INTERVAL
@@ -230,33 +186,47 @@ def ejecutar():
             estado = clasificar_estado(data)
 
             if estado == "activo":
-                logging.info("Servidor activo.")
+                logging.info("El servidor está activo.")
+                inicio_solicitado = False
                 espera = ONLINE_INTERVAL
 
             elif estado == "ocupado":
                 logging.info(
-                    "Servidor en transición, cola o almacenamiento. "
-                    "No se enviará ninguna orden."
+                    "Servidor ocupado o en transición. "
+                    "No se enviará otra orden."
                 )
                 espera = BUSY_INTERVAL
 
             elif estado == "apagado":
-                logging.warning(
-                    "Servidor apagado. Se intentará iniciar una vez."
-                )
-
-                try:
-                    iniciar_servidor(api_key)
+                if inicio_solicitado:
+                    logging.info(
+                        "Ya se solicitó el inicio. "
+                        "Se comprobará el estado antes de repetir."
+                    )
                     espera = OFFLINE_INTERVAL
+                else:
+                    logging.warning(
+                        "Servidor apagado. Solicitando inicio."
+                    )
 
-                except PermissionError as error:
-                    # Un 403 no se arregla repitiendo la misma orden.
-                    logging.error("%s", error)
-                    espera = ERROR_INTERVAL
+                    try:
+                        iniciar_servidor(api_key)
+                        inicio_solicitado = True
+                        espera = OFFLINE_INTERVAL
 
-                except RuntimeError as error:
-                    logging.error("%s", error)
-                    espera = ERROR_INTERVAL
+                    except PermissionError as error:
+                        logging.error("%s", error)
+                        espera = ERROR_INTERVAL
+
+                    except requests.RequestException as error:
+                        logging.error(
+                            "Fallo de conexión al iniciar: %s",
+                            type(error).__name__,
+                        )
+                        # La orden podría haber llegado a Falix
+                        # aunque la respuesta se haya perdido.
+                        inicio_solicitado = True
+                        espera = ERROR_INTERVAL
 
             else:
                 logging.warning(
@@ -264,20 +234,9 @@ def ejecutar():
                 )
                 espera = ERROR_INTERVAL
 
-        except PermissionError as error:
-            logging.error("Error de permisos: %s", error)
-            espera = ERROR_INTERVAL
-
-        except requests.RequestException as error:
-            logging.error(
-                "Error de conexión tras los reintentos: %s",
-                type(error).__name__,
-            )
-            espera = ERROR_INTERVAL
-
         except Exception as error:
             logging.error(
-                "Error inesperado: %s: %s",
+                "Error: %s: %s",
                 type(error).__name__,
                 error,
             )
